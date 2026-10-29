@@ -98,6 +98,7 @@ GSA is part of the UCM Sparse Attention module. For installation instructions, p
 
 ```bash
 export ENABLE_UCM_PATCH=TRUE
+export ENABLE_GSA_PATCH=TRUE
 python examples/offline_inference_gsaondevice.py
 ```
 
@@ -106,6 +107,7 @@ python examples/offline_inference_gsaondevice.py
 export VLLM_USE_V1=1
 export ENABLE_SPARSE=TRUE
 export ENABLE_UCM_PATCH=1
+export ENABLE_GSA_PATCH=1
 export VLLM_HASH_ATTENTION=1
 export PYTHONHASHSEED=123456
 
