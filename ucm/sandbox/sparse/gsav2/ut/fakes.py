@@ -268,8 +268,8 @@ class FakeUCMPrefetch:
         self.calls = []
         self.lookup_results = None  # e.g. [[False]*4, [True]*4]
 
-    def store_init(self, ptr):
-        self.calls.append(("store_init", ptr))
+    def store_init(self, ptr, layer_num):
+        self.calls.append(("store_init", ptr, layer_num))
 
     def ucm_lookup(self, ids):
         self.calls.append(("ucm_lookup", len(ids)))
@@ -281,7 +281,9 @@ class FakeUCMPrefetch:
 
     def ucm_load_ssd(self, ids):
         self.calls.append(("ucm_load_ssd", len(ids)))
-        return True
+        # 与 C++ PrefetchStatus::GSA_PREFETCH_DONE 对齐（load-to-host-buffer
+        # 迁移后返回状态码而非任务 id / 布尔值）
+        return 0
 
 
 # ---------------------------------------------------------------------------

@@ -74,7 +74,10 @@ struct LastChunkFixture {
         CleanupShmFor(dpRank);
         logFile = std::make_unique<TempLogFile>();
         store = std::make_unique<MockStoreV1>();
-        // Each UCM host buffer must hold K+V for one block.
+        // Note: the mock's LoadToHostBuffer payload config below is no longer
+        // used by LastChunkMove (the load-to-host-buffer migration switched it
+        // to a synchronous Load + Wait into the engine staging buffer); kept
+        // for the other mock consumers.
         store->SetHostBufferPayload(static_cast<size_t>(kBlockBytes + vBlockBytes),
                                     static_cast<size_t>(kBlockBytes));
 
@@ -150,6 +153,18 @@ TEST(LastChunkMoveFlow, UcmAndNonUcmBlocksLandInCorrectHbmSlots)
     // moveMap is normally `manager.mSlotToGlobal`; it must be blockCount*blockSize.
     ASSERT_EQ(moveMap.size() % f.blockSize, 0u);
 
+    // Since the load-to-host-buffer migration the UCM load lands in the
+    // engine-owned staging buffer (mLastChunkLoadBuffer, allocated by the
+    // ctor): LoadLastChunkSources maps loaded block i to
+    // bufferBase + i*mShardSize (K) / +kBlockBytes (V). Pre-fill the staging
+    // slots that stand in for the two UCM blocks.
+    auto* staging = static_cast<std::byte*>(f.engine->mLastChunkLoadBuffer);
+    const size_t shard = f.engine->mShardSize;
+    std::memset(staging, 0x01, f.kBlockBytes);                    // UCM block 0 K
+    std::memset(staging + f.kBlockBytes, 0x11, f.vBlockBytes);    // UCM block 0 V
+    std::memset(staging + shard, 0x02, f.kBlockBytes);            // UCM block 1 K
+    std::memset(staging + shard + f.kBlockBytes, 0x22, f.vBlockBytes);  // UCM block 1 V
+
     f.engine->LastChunkMove(/*layerID=*/0, "req1", moveMap);
 
     // UCM block 0 -> HBM slot 10. Mock fills view[0] with 0x01.
@@ -169,14 +184,17 @@ TEST(LastChunkMoveFlow, UcmAndNonUcmBlocksLandInCorrectHbmSlots)
     }
     // V path (non-c8 mode): non-UCM V is 0xCD.
     for (int i = 0; i < f.vBlockBytes; ++i) { EXPECT_EQ(f.vHbm[30 * f.vBlockBytes + i], 0xCDu); }
-    // Store should have been called for the UCM load + release.
-    bool hasLoad = false, hasRelease = false;
+    // Store interaction is the synchronous UCM Load + Wait into staging;
+    // the host buffer release is gone with the load-to-host-buffer migration.
+    bool hasLoad = false, hasWait = false, hasRelease = false;
     for (const auto& c : f.store->calls) {
-        if (c.name == "LoadToHostBuffer") { hasLoad = true; }
+        if (c.name == "Load") { hasLoad = true; }
+        if (c.name == "Wait") { hasWait = true; }
         if (c.name == "ReleaseHostBuffer") { hasRelease = true; }
     }
     EXPECT_TRUE(hasLoad);
-    EXPECT_TRUE(hasRelease);
+    EXPECT_TRUE(hasWait);
+    EXPECT_FALSE(hasRelease);
 
     f.TearDown();
 }
@@ -211,7 +229,7 @@ TEST(LastChunkMoveFlow, StoreLoadFailureAbortsBeforeCopy)
     LastChunkFixture f;
     f.Setup();
     f.SeedBlocksMap();
-    f.store->loadToHostBufferFails = true;
+    f.store->loadFails = true;  // synchronous Load into staging fails
     std::vector<int> moveMap = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     f.engine->LastChunkMove(0, "req1", moveMap);
     // On load failure, LastChunkMove returns early; HBM stays untouched.

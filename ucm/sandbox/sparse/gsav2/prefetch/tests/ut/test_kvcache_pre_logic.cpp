@@ -274,8 +274,9 @@ TEST_F(PreLogicTest, BuildUCMMergeBlockContextsGroupsTokensByBlockAndOwnedShards
     std::vector<UCMMergeBlockContext> blockContexts;
     UC::Detail::TaskDesc task;
     std::map<int, std::vector<size_t>> blockIdxToTokenIdx;
+    std::byte staging[128];
     engine->BuildUCMMergeBlockContexts(/*layerID=*/0, reqID, /*requestIndex=*/0, blockContexts,
-                                       task, blockIdxToTokenIdx);
+                                       task, blockIdxToTokenIdx, staging, /*shardSize=*/64);
     // Two blocks: 0 (tokens 0,1) and 2 (token 2).
     EXPECT_EQ(blockContexts.size(), 2u);
     EXPECT_EQ(blockIdxToTokenIdx.size(), 2u);
@@ -283,6 +284,11 @@ TEST_F(PreLogicTest, BuildUCMMergeBlockContextsGroupsTokensByBlockAndOwnedShards
     EXPECT_EQ(blockIdxToTokenIdx[2], (std::vector<size_t>{2}));
     // All owned, no non-UCM blocks -> task has 2 shards.
     EXPECT_EQ(task.size(), 2u);
+    // Shard staging addresses: bufferBase + task.size()*shardSize at insert.
+    ASSERT_EQ(task[0].addrs.size(), 1u);
+    EXPECT_EQ(task[0].addrs[0], static_cast<void*>(staging + 0 * 64));
+    ASSERT_EQ(task[1].addrs.size(), 1u);
+    EXPECT_EQ(task[1].addrs[0], static_cast<void*>(staging + 1 * 64));
     // tokenBase accumulates: first block 0 -> base 0, second block 2 -> base 2.
     EXPECT_EQ(blockContexts[0].tokenBase, 0u);
     EXPECT_EQ(blockContexts[1].tokenBase, 2u);
@@ -303,7 +309,8 @@ TEST_F(PreLogicTest, BuildUCMMergeBlockContextsMarksNonUcmBlocksAndSkipsShard)
     std::vector<UCMMergeBlockContext> blockContexts;
     UC::Detail::TaskDesc task;
     std::map<int, std::vector<size_t>> blockIdxToTokenIdx;
-    engine->BuildUCMMergeBlockContexts(0, reqID, 0, blockContexts, task, blockIdxToTokenIdx);
+    engine->BuildUCMMergeBlockContexts(0, reqID, 0, blockContexts, task, blockIdxToTokenIdx,
+                                        nullptr, /*shardSize=*/64);
     ASSERT_EQ(blockContexts.size(), 1u);
     EXPECT_TRUE(blockContexts[0].isnoUCMblock);
     // owned but non-UCM block -> no shard pushed.
@@ -442,36 +449,19 @@ TEST_F(PreLogicTest, ReleaseUCMMergeHostAddressIsNoopWhenNoHostTask)
     EXPECT_TRUE(store->calls.empty());
 }
 
-TEST_F(PreLogicTest, ReleaseUCMMergeHostAddressReleasesAndClearsState)
+TEST_F(PreLogicTest, ReleaseUCMMergeHostAddressClearsStateWithoutStoreCalls)
 {
+    // Since the load-to-host-buffer migration the merge load lands in the
+    // shared staging buffer owned by the engine, so releasing an address only
+    // clears the bookkeeping state: no ReleaseHostBuffer store call happens.
     engine = MakeEngine();
     UCMMergeHostAddress addr(*engine);
     addr.hasHostTask = true;
-    addr.taskId = UC::Detail::TaskHandle{42};
-    addr.views.push_back({});
     addr.addresses.push_back(nullptr);
     engine->ReleaseUCMMergeHostAddress(addr);
     EXPECT_FALSE(addr.hasHostTask);
-    EXPECT_TRUE(addr.views.empty());
     EXPECT_TRUE(addr.addresses.empty());
-    ASSERT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "ReleaseHostBuffer");
-}
-
-TEST_F(PreLogicTest, ReleaseUCMMergeHostAddressLogsErrorOnReleaseFailure)
-{
-    engine = MakeEngine();
-    store->releaseHostBufferFails = true;
-    UCMMergeHostAddress addr(*engine);
-    addr.hasHostTask = true;
-    addr.taskId = UC::Detail::TaskHandle{42};
-    addr.views.push_back({});
-    addr.addresses.push_back(nullptr);
-    // ReleaseHostBuffer fails -> logs error but still clears state.
-    engine->ReleaseUCMMergeHostAddress(addr);
-    EXPECT_FALSE(addr.hasHostTask);
-    EXPECT_TRUE(addr.views.empty());
-    store->releaseHostBufferFails = false;
+    EXPECT_TRUE(store->calls.empty());
 }
 
 /* ---------------- LoadUCMMergeHostAddress ---------------- */
@@ -495,47 +485,70 @@ TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenAddressDirty)
     EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
 }
 
-TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenStoreFails)
+TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenLoadFails)
 {
     engine = MakeEngine();
-    store->loadToHostBufferFails = true;
+    engine->mShardSize = 64;
+    engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(std::malloc(256));
+    store->loadFails = true;
     UCMMergeHostAddress addr(*engine);
     UC::Detail::TaskDesc task;
     task.resize(1);
     EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
     EXPECT_FALSE(addr.hasHostTask);
+    std::free(engine->mUCMMergeLoadBuffer);
+    engine->mUCMMergeLoadBuffer = nullptr;
 }
 
-TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseOnViewCountMismatch)
+TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenWaitFails)
 {
     engine = MakeEngine();
-    store->mismatchedViewCount = true;
+    engine->mShardSize = 64;
+    engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(std::malloc(256));
+    store->waitFails = true;
     UCMMergeHostAddress addr(*engine);
     UC::Detail::TaskDesc task;
     task.resize(1);
     EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
+    EXPECT_FALSE(addr.hasHostTask);
+    std::free(engine->mUCMMergeLoadBuffer);
+    engine->mUCMMergeLoadBuffer = nullptr;
 }
 
-TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseOnNullHostAddr)
+TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenStagingNotInitialized)
 {
     engine = MakeEngine();
-    store->nullHostAddr = true;
+    // mShardSize defaults to a real value (engine ctor calls
+    // InitLastChunkLoadBuffer), but mUCMMergeLoadBuffer is only set up by the
+    // KVPack shared-buffer flow; leave it null to hit the guard.
+    engine->mUCMMergeLoadBuffer = nullptr;
     UCMMergeHostAddress addr(*engine);
     UC::Detail::TaskDesc task;
     task.resize(1);
     EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
+    EXPECT_TRUE(store->calls.empty());  // guard fires before any store call
 }
 
 TEST_F(PreLogicTest, LoadUCMMergeHostAddressSucceedsAndPopulatesAddresses)
 {
     engine = MakeEngine();
+    engine->mShardSize = 64;
+    engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(std::malloc(256));
     UCMMergeHostAddress addr(*engine);
     UC::Detail::TaskDesc task;
     task.resize(2);
     EXPECT_TRUE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
     EXPECT_TRUE(addr.hasHostTask);
-    EXPECT_EQ(addr.addresses.size(), 2u);
-    EXPECT_NE(addr.addresses[0], nullptr);
+    ASSERT_EQ(addr.addresses.size(), 2u);
+    // Staging addresses: bufferBase + i * mShardSize.
+    EXPECT_EQ(addr.addresses[0], engine->mUCMMergeLoadBuffer + 0 * 64);
+    EXPECT_EQ(addr.addresses[1], engine->mUCMMergeLoadBuffer + 1 * 64);
+    // Store interaction: synchronous Load + Wait.
+    ASSERT_EQ(store->calls.size(), 2u);
+    EXPECT_EQ(store->calls[0].name, "Load");
+    EXPECT_EQ(store->calls[1].name, "Wait");
+    std::free(engine->mUCMMergeLoadBuffer);
+    engine->mUCMMergeLoadBuffer = nullptr;
 }
 
 TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenStoreNull)
@@ -870,7 +883,9 @@ TEST_F(PreLogicTest, UCMTensorMergeReturnsEarlyWhenNoMissTokens)
 TEST_F(PreLogicTest, UCMTensorMergeFallsBackToZeroOnStoreFailure)
 {
     engine = MakeEngine(/*layerNum=*/1);
-    store->loadToHostBufferFails = true;
+    engine->mShardSize = 64;
+    engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(std::malloc(256));
+    store->loadFails = true;
     const std::string reqID = "req1";
     engine->mMissGlobalToken[reqID].assign(engine->mTopkIndexerNum, {});
     engine->mMissGlobalToken[reqID][0] = {0, 4};  // 2 miss tokens
@@ -897,14 +912,18 @@ TEST_F(PreLogicTest, UCMTensorMergeFallsBackToZeroOnStoreFailure)
     // Load failed -> FillFailedUCMMerge ran; mLoadNum updated to finalLoadNum=2.
     EXPECT_EQ(engine->mLoadNum[0], 2);
     ASSERT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "LoadToHostBuffer");
+    EXPECT_EQ(store->calls[0].name, "Load");
     std::free(kBuf);
     std::free(vBuf);
+    std::free(engine->mUCMMergeLoadBuffer);
+    engine->mUCMMergeLoadBuffer = nullptr;
 }
 
 TEST_F(PreLogicTest, UCMTensorMergeSucceedsAndUpdatesLoadNum)
 {
     engine = MakeEngine(/*layerNum=*/1);
+    engine->mShardSize = 64;
+    engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(std::malloc(256));
     const std::string reqID = "req1";
     engine->mMissGlobalToken[reqID].assign(engine->mTopkIndexerNum, {});
     engine->mMissGlobalToken[reqID][0] = {0};  // 1 miss token (block 0)
@@ -930,12 +949,14 @@ TEST_F(PreLogicTest, UCMTensorMergeSucceedsAndUpdatesLoadNum)
     engine->UCMTensorMerge(0, 0, hbmSlotIndex, reqID, 0);
     // Success path: mLoadNum updated to finalLoadNum=1, no zero fallback.
     EXPECT_EQ(engine->mLoadNum[0], 1);
-    // LoadToHostBuffer (load) + ReleaseHostBuffer (UCMMergeHostAddress dtor).
+    // Synchronous Load + Wait (UCMMergeHostAddress release has no store call).
     ASSERT_EQ(store->calls.size(), 2u);
-    EXPECT_EQ(store->calls[0].name, "LoadToHostBuffer");
-    EXPECT_EQ(store->calls[1].name, "ReleaseHostBuffer");
+    EXPECT_EQ(store->calls[0].name, "Load");
+    EXPECT_EQ(store->calls[1].name, "Wait");
     std::free(kBuf);
     std::free(vBuf);
+    std::free(engine->mUCMMergeLoadBuffer);
+    engine->mUCMMergeLoadBuffer = nullptr;
 }
 
 /* ---------------- CopyUCMMergeTokensSerial ---------------- */
@@ -993,7 +1014,7 @@ TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseOnInvalidBlockCount)
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
     EXPECT_FALSE(engine->PrepareLastChunkSources(0, "req1", moveMap, blockTable, sourceBlocks, task,
-                                                 loadedBlockIndices));
+                                                 loadedBlockIndices, nullptr, 0));
 }
 
 TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseWhenBlockTableTooSmall)
@@ -1007,7 +1028,7 @@ TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseWhenBlockTableTooSmall)
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
     EXPECT_FALSE(engine->PrepareLastChunkSources(0, "req1", moveMap, blockTable, sourceBlocks, task,
-                                                 loadedBlockIndices));
+                                                 loadedBlockIndices, nullptr, 0));
 }
 
 TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseWhenHbmSlotOutOfRange)
@@ -1021,7 +1042,7 @@ TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseWhenHbmSlotOutOfRange)
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
     EXPECT_FALSE(engine->PrepareLastChunkSources(0, "req1", moveMap, blockTable, sourceBlocks, task,
-                                                 loadedBlockIndices));
+                                                 loadedBlockIndices, nullptr, 0));
 }
 
 TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseWhenNoNonUcmBlockMap)
@@ -1037,7 +1058,7 @@ TEST_F(PreLogicTest, PrepareLastChunkSourcesReturnsFalseWhenNoNonUcmBlockMap)
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
     EXPECT_FALSE(engine->PrepareLastChunkSources(0, "req1", moveMap, blockTable, sourceBlocks, task,
-                                                 loadedBlockIndices));
+                                                 loadedBlockIndices, nullptr, 0));
 }
 
 TEST_F(PreLogicTest, PrepareLastChunkSourcesBuildsUcmShards)
@@ -1054,11 +1075,15 @@ TEST_F(PreLogicTest, PrepareLastChunkSourcesBuildsUcmShards)
     std::vector<LastChunkSourceBlock> sourceBlocks;
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
+    std::byte staging[128];
     EXPECT_TRUE(engine->PrepareLastChunkSources(0, "req1", moveMap, blockTable, sourceBlocks, task,
-                                                loadedBlockIndices));
+                                                loadedBlockIndices, staging, /*shardSize=*/64));
     ASSERT_EQ(task.size(), 1u);  // 1 UCM shard for block 0
     EXPECT_EQ(loadedBlockIndices.size(), 1u);
     EXPECT_EQ(loadedBlockIndices[0], 0);
+    // The shard lands in the caller-provided staging buffer (DDR load).
+    ASSERT_EQ(task[0].addrs.size(), 1u);
+    EXPECT_EQ(task[0].addrs[0], static_cast<void*>(staging + 0 * 64));
 }
 
 /* ---------------- BuildLastChunkSources (non-UCM path) ---------------- */
@@ -1077,8 +1102,8 @@ TEST_F(PreLogicTest, BuildLastChunkSourcesHandlesNonUcmBlock)
     std::vector<LastChunkSourceBlock> sourceBlocks;
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
-    EXPECT_TRUE(
-        engine->BuildLastChunkSources(0, "req1", moveMap, sourceBlocks, task, loadedBlockIndices));
+    EXPECT_TRUE(engine->BuildLastChunkSources(0, "req1", moveMap, sourceBlocks, task,
+                                              loadedBlockIndices, nullptr, 0));
     EXPECT_TRUE(task.empty());           // non-UCM -> no shard
     ASSERT_GE(sourceBlocks.size(), 6u);  // resized to blockIdx+1=6
     EXPECT_NE(sourceBlocks[5].kBase, nullptr);
@@ -1094,8 +1119,8 @@ TEST_F(PreLogicTest, BuildLastChunkSourcesReturnsFalseOnNegativeToken)
     std::vector<LastChunkSourceBlock> sourceBlocks;
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
-    EXPECT_FALSE(
-        engine->BuildLastChunkSources(0, "req1", moveMap, sourceBlocks, task, loadedBlockIndices));
+    EXPECT_FALSE(engine->BuildLastChunkSources(0, "req1", moveMap, sourceBlocks, task,
+                                               loadedBlockIndices, nullptr, 0));
 }
 
 TEST_F(PreLogicTest, BuildLastChunkSourcesReturnsFalseWhenNonUcmBlockMissing)
@@ -1108,8 +1133,8 @@ TEST_F(PreLogicTest, BuildLastChunkSourcesReturnsFalseWhenNonUcmBlockMissing)
     std::vector<LastChunkSourceBlock> sourceBlocks;
     UC::Detail::TaskDesc task;
     std::vector<int> loadedBlockIndices;
-    EXPECT_FALSE(
-        engine->BuildLastChunkSources(0, "req1", moveMap, sourceBlocks, task, loadedBlockIndices));
+    EXPECT_FALSE(engine->BuildLastChunkSources(0, "req1", moveMap, sourceBlocks, task,
+                                               loadedBlockIndices, nullptr, 0));
 }
 
 /* ---------------- LoadLastChunkSources ---------------- */
@@ -1120,55 +1145,43 @@ TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsTrueWhenTaskEmpty)
     UC::Detail::TaskDesc task;  // empty -> early return true
     std::vector<int> loadedBlockIndices;
     std::vector<LastChunkSourceBlock> sourceBlocks;
-    UC::Detail::TaskHandle hostTaskId{0};
-    bool hasHostTask = false;
-    EXPECT_TRUE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks,
-                                             hostTaskId, hasHostTask));
-    EXPECT_FALSE(hasHostTask);
+    EXPECT_TRUE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks));
 }
 
-TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsFalseWhenStoreFails)
+TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsFalseWhenLoadFails)
 {
     engine = MakeEngine(/*layerNum=*/1);
-    store->loadToHostBufferFails = true;
+    store->loadFails = true;
     UC::Detail::TaskDesc task;
     task.resize(1);
     std::vector<int> loadedBlockIndices = {0};
     std::vector<LastChunkSourceBlock> sourceBlocks(1);
-    UC::Detail::TaskHandle hostTaskId{0};
-    bool hasHostTask = false;
-    EXPECT_FALSE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks,
-                                              hostTaskId, hasHostTask));
+    EXPECT_FALSE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks));
 }
 
-TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsFalseOnViewCountMismatch)
+TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsFalseWhenWaitFails)
 {
     engine = MakeEngine(/*layerNum=*/1);
-    store->mismatchedViewCount = true;
+    store->waitFails = true;
     UC::Detail::TaskDesc task;
     task.resize(1);
     std::vector<int> loadedBlockIndices = {0};
     std::vector<LastChunkSourceBlock> sourceBlocks(1);
-    UC::Detail::TaskHandle hostTaskId{0};
-    bool hasHostTask = false;
-    EXPECT_FALSE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks,
-                                              hostTaskId, hasHostTask));
-    ASSERT_EQ(store->calls.size(), 2u);  // LoadToHostBuffer + ReleaseHostBuffer
-    EXPECT_EQ(store->calls[1].name, "ReleaseHostBuffer");
+    EXPECT_FALSE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks));
+    ASSERT_EQ(store->calls.size(), 2u);  // Load + Wait
+    EXPECT_EQ(store->calls[0].name, "Load");
+    EXPECT_EQ(store->calls[1].name, "Wait");
 }
 
-TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsFalseOnNullHostAddr)
+TEST_F(PreLogicTest, LoadLastChunkSourcesReturnsFalseWhenStoreNull)
 {
     engine = MakeEngine(/*layerNum=*/1);
-    store->nullHostAddr = true;
+    engine->SetStoreV1(nullptr);
     UC::Detail::TaskDesc task;
     task.resize(1);
     std::vector<int> loadedBlockIndices = {0};
     std::vector<LastChunkSourceBlock> sourceBlocks(1);
-    UC::Detail::TaskHandle hostTaskId{0};
-    bool hasHostTask = false;
-    EXPECT_FALSE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks,
-                                              hostTaskId, hasHostTask));
+    EXPECT_FALSE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks));
 }
 
 TEST_F(PreLogicTest, LoadLastChunkSourcesSucceedsAndPopulatesSourceBlocks)
@@ -1178,13 +1191,14 @@ TEST_F(PreLogicTest, LoadLastChunkSourcesSucceedsAndPopulatesSourceBlocks)
     task.resize(1);
     std::vector<int> loadedBlockIndices = {0};
     std::vector<LastChunkSourceBlock> sourceBlocks(1);
-    UC::Detail::TaskHandle hostTaskId{0};
-    bool hasHostTask = false;
-    EXPECT_TRUE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks,
-                                             hostTaskId, hasHostTask));
-    EXPECT_TRUE(hasHostTask);
-    EXPECT_NE(sourceBlocks[0].kBase, nullptr);
-    EXPECT_NE(sourceBlocks[0].vBase, nullptr);  // !mISSPAC8
+    EXPECT_TRUE(engine->LoadLastChunkSources(0, "req1", task, loadedBlockIndices, sourceBlocks));
+    // Staging layout (set up by the ctor via InitLastChunkLoadBuffer):
+    // kBase = mLastChunkLoadBuffer + i*mShardSize, vBase = kBase + kBlockBytes.
+    const auto* staging = static_cast<const std::byte*>(engine->mLastChunkLoadBuffer);
+    const size_t kBlockBytes = static_cast<size_t>(engine->mBlockSize) *
+                               static_cast<size_t>(engine->mKVSizeBytesToken);
+    EXPECT_EQ(sourceBlocks[0].kBase, staging);
+    EXPECT_EQ(sourceBlocks[0].vBase, staging + kBlockBytes);  // !mISSPAC8
 }
 
 /* ---------------- CopyLastChunkTokens ---------------- */
@@ -1212,36 +1226,15 @@ TEST_F(PreLogicTest, CopyLastChunkTokensCopiesTokensSerially)
     std::vector<LastChunkSourceBlock> sourceBlocks = {
         {kSrcBlock, vSrcBlock},
     };
-    engine->CopyLastChunkTokens(0, "req1", moveMap, sourceBlocks,
-                                /*hostTaskId=*/UC::Detail::TaskHandle{0}, /*hasHostTask=*/false);
+    // Since the load-to-host-buffer migration CopyLastChunkTokens is a pure
+    // per-token CPU copy out of the staging sources: no host-buffer release.
+    engine->CopyLastChunkTokens(0, "req1", moveMap, sourceBlocks);
     // Verify K copied: kDst[i*kTokenBytes .. +kTokenBytes) == kSrcBlock[i*kTokenBytes ..]
     EXPECT_EQ(std::memcmp(kDst, kSrcBlock, 8), 0);          // token 0
     EXPECT_EQ(std::memcmp(kDst + 8, kSrcBlock + 8, 8), 0);  // token 1
     // Verify V copied: vDst[i*vTokenBytes ..] == vSrcBlock[i*vTokenBytes ..]
     EXPECT_EQ(std::memcmp(vDst, vSrcBlock, 8), 0);
-    std::free(kDst);
-    std::free(vDst);
-}
-
-TEST_F(PreLogicTest, CopyLastChunkTokensReleasesHostBufferWhenHasHostTask)
-{
-    engine = MakeEngine(/*layerNum=*/1);
-    constexpr size_t kBufBytes = 256;
-    std::byte* kDst = static_cast<std::byte*>(std::malloc(kBufBytes));
-    std::byte* vDst = static_cast<std::byte*>(std::malloc(kBufBytes));
-    engine->mLastCHunkKPtr.resize(1);
-    engine->mLastCHunkVPtr.resize(1);
-    engine->mLastCHunkKPtr[0] = reinterpret_cast<uint64_t>(kDst);
-    engine->mLastCHunkVPtr[0] = reinterpret_cast<uint64_t>(vDst);
-    std::byte kSrcBlock[64], vSrcBlock[64];
-    std::vector<int> moveMap = {0};
-    std::vector<LastChunkSourceBlock> sourceBlocks = {
-        {kSrcBlock, vSrcBlock}
-    };
-    engine->CopyLastChunkTokens(0, "req1", moveMap, sourceBlocks,
-                                /*hostTaskId=*/UC::Detail::TaskHandle{42}, /*hasHostTask=*/true);
-    ASSERT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "ReleaseHostBuffer");
+    EXPECT_TRUE(store->calls.empty());
     std::free(kDst);
     std::free(vDst);
 }
@@ -1271,11 +1264,17 @@ TEST_F(PreLogicTest, LastChunkMoveEndToEndWithUcmBlock)
     engine->mLastCHunkVPtr.resize(1);
     engine->mLastCHunkKPtr[0] = reinterpret_cast<uint64_t>(kDst);
     engine->mLastCHunkVPtr[0] = reinterpret_cast<uint64_t>(vDst);
+    // H2D destinations for the trailing CopyTrans loop (avoid OOB on empty ptrs).
+    std::vector<uint64_t> kCache(64, 0), vCache(64, 0);
+    engine->mKcachePtr.resize(1);
+    engine->mVcachePtr.resize(1);
+    engine->mKcachePtr[0] = reinterpret_cast<uint64_t>(kCache.data());
+    engine->mVcachePtr[0] = reinterpret_cast<uint64_t>(vCache.data());
     engine->LastChunkMove(0, reqID, moveMap);
-    // End-to-end: PrepareLastChunkSources -> LoadLastChunkSources (mock) ->
-    // CopyLastChunkTokens -> ReleaseHostBuffer.
+    // End-to-end: PrepareLastChunkSources -> LoadLastChunkSources (synchronous
+    // Load + Wait into the engine staging buffer) -> CopyLastChunkTokens.
     ASSERT_GE(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "LoadToHostBuffer");
+    EXPECT_EQ(store->calls[0].name, "Load");
     std::free(kDst);
     std::free(vDst);
 }

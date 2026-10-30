@@ -4,11 +4,12 @@
  * MST: cross-module flow for UCMTensorMerge.
  *
  * UCMTensorMerge ties together HBM miss-bookkeeping (mMissGlobalToken /
- * mLoadSlot), the UCM store (LoadToHostBuffer / ReleaseHostBuffer), the
- * multi-rank KVPack shared staging buffers, and the CPU token-merge loop.  We
- * drive it with a mock store and the ACL stub, and verify both the success path
- * (hbmSlotIndex filled, loadNum advanced) and the failure fallback path
- * (FillFailedUCMMerge zeroes owned tokens while preserving all-rank indices).
+ * mLoadSlot), the UCM store (synchronous Load + Wait into the merge staging
+ * buffer), the multi-rank KVPack shared staging buffers, and the CPU
+ * token-merge loop.  We drive it with a mock store and the ACL stub, and
+ * verify both the success path (hbmSlotIndex filled, loadNum advanced) and
+ * the failure fallback path (FillFailedUCMMerge zeroes owned tokens while
+ * preserving all-rank indices).
  */
 #include <cstring>
 #include <gtest/gtest.h>
@@ -78,6 +79,11 @@ struct MergeFixture {
         sharedV.assign(64, 0xBB);
         engine->mSharedKBufferHostPtr.assign(1, reinterpret_cast<uint64_t>(sharedK.data()));
         engine->mSharedVBufferHostPtr.assign(1, reinterpret_cast<uint64_t>(sharedV.data()));
+        // UCM merge staging buffer (normally set up by the KVPack shared-buffer
+        // flow; seed it manually here). The engine does not own this pointer,
+        // so TearDown frees it.
+        engine->mShardSize = 4096;
+        engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(std::malloc(16 * 4096));
         engine->mLoadIndexBufferLen = 256;
         engine->mKVBufferLen = 256;
         engine->mLoadNum.assign(kLayerNum, 0);
@@ -85,6 +91,10 @@ struct MergeFixture {
 
     void TearDown()
     {
+        if (engine != nullptr && engine->mUCMMergeLoadBuffer != nullptr) {
+            std::free(engine->mUCMMergeLoadBuffer);
+            engine->mUCMMergeLoadBuffer = nullptr;
+        }
         engine.reset();
         store.reset();
         acl_stub::Stub().Reset();
@@ -164,7 +174,7 @@ TEST(UCMMergeFlow, StoreLoadFailureFallsBackToZeroedOwnedTokens)
     f.Setup();
     f.SeedMissScenario();
     f.engine->mLoadSlot["req1"][0] = {0, 1, 4, 5};
-    f.store->loadToHostBufferFails = true;
+    f.store->loadFails = true;  // synchronous Load into the merge staging fails
     // Clear shared buffers so we can detect the zero-fill fallback.
     std::memset(f.sharedK.data(), 0xCC, f.sharedK.size());
     std::memset(f.sharedV.data(), 0xDD, f.sharedV.size());

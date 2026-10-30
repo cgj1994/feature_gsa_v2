@@ -31,7 +31,7 @@ tests/
 │   ├── test_hbm_manager.cpp            # HBMManager：LRU、pinned 槽、miss/eviction、不变量
 │   ├── test_logger.cpp                 # Logger：日志级别、过滤、文件生命周期
 │   ├── test_kvcache_pre_detail.cpp     # KVPackFail/Abort、结构体、average/average2d
-│   ├── test_ucm_kv_prefetch.cpp        # UCMKVPrefetch 异步 load/wait/lookup 生命周期
+│   ├── test_ucm_kv_prefetch.cpp        # UCMKVPrefetch store-init/load/lookup 状态码接口
 │   ├── test_kvcache_trans_ascend.cpp   # 经桩驱动的 ACL 封装（成功 + 失败分支）
 │   ├── test_kvcache_task_manger.cpp    # TaskManager 线程池 + TaskInfo/ThreadInfo/TaskWrapper
 │   ├── test_gsa_prefetch_engine.cpp    # GSAPrefetchEngineC 可测试的 public 接口
@@ -109,7 +109,7 @@ cd ucm/sparse/gsa/prefetch/tests
 | 生产依赖 | 测试替身 | 失败注入方式 |
 |---------|---------|--------------|
 | `<acl/acl.h>`、`<aclnnop/…>` | `kvcache_trans_ascend_stub.h` | `acl_stub::Stub().memcpyAsyncFails`、`…mallocFails`、`…createStreamFails` 等 |
-| `UC::StoreV1`（`mStoreV1_`） | `common/mock_store_v1.h`（`MockStoreV1`） | `loadToHostBufferFails`、`loadToDeviceFails`、`mismatchedViewCount`、`nullHostAddr` 等 |
+| `UC::StoreV1`（`mStoreV1_`） | `common/mock_store_v1.h`（`MockStoreV1`） | `loadFails`、`waitFails`、`lookupFails`、`loadToHostBufferFails`（遗留）、`mismatchedViewCount`（遗留）等 |
 | `securec.h` | `common/securec.h`（空） | 无（源码未引用任何 securec 符号） |
 | ACL scatter / H2D | 桩 `aclrtMemcpyAsync` 执行真实 `memcpy`；`aclnnInplaceScatter` 为空操作 | `inplaceScatterFails`、`memcpyAsyncFails` |
 | torch_npu | 不需要（仅使用 `at::Tensor` / `torch::Tensor`） | 无 |
@@ -164,11 +164,12 @@ cd ucm/sparse/gsa/prefetch/tests
    - 测试：`test_kvcache_trans_ascend.cpp / AscendTrans.IsStreamIdleReturnsFalseOnQueryFailure`。
    - 修复建议：传播错误（返回 enum 或在 ERROR 级别记录日志）。
 
-6. **`kvcache_pre.cpp` —— `average2d` 在非空但全为空行的矩阵上除零。**
+6. **`kvcache_pre.cpp` —— `average2d` 在非空但全为空行的矩阵上除零。**（已修复）
    当 `matrix` 非空但每行都为空时，`count == 0`，最终 `sum / count` 产生
    NaN。
-   - 测试：`test_kvcache_pre_detail.cpp / Average2dBug.NonEmptyMatrixOfEmptyRowsProducesNaNByZeroDivision`。
-   - 修复建议：加 `if (count == 0) { return 0.0f; }` 保护。
+   - 测试：`test_kvcache_pre_detail.cpp / Average2dBug.NonEmptyMatrixOfEmptyRowsReturnsZeroAfterFix`。
+   - 修复已合入（load-to-host-buffer 迁移合并时保留了目标侧的
+     `if (count == 0) { return 0.0f; }` 保护，与补丁中等价的 `return 0;` 二选一）。
 
 7. **`kvcache_pre.cpp` —— `SetTokensMap` 在首次 layer-0 调用且
    `isNeedInit=false` 时会解引用空 `HBMManager*`。**
@@ -210,16 +211,16 @@ cd ucm/sparse/gsa/prefetch/tests
      并/或在索引前保证 `mUseBlockTableIdx[reqID]` 已 resize 到 `mLayerNum`。
 
 11. **`kvcache_prefetch.h` —— `UCMLoadSSD` 从未将任务入队 `mWaitQueue_`。**
-    `UCMLoadSSD` 把加载句柄登记到 `mTaskHandle`，却从不把 `taskID` 推入
-    `mWaitQueue_`，也不 `notify` `mTaskCv_`。结果是后台 `AsyncWaitLoop` 永远不会
-    被唤醒处理该任务，`WaitSSDToHost` / `ReleaseHostBuffer` 从不被调用，随后调用
-    `UCMWait(taskID)` 会永久阻塞（其断言 `mTaskHandle.find(taskID) == end()` 永不
-    为真）。`mWaitQueue_` 成员只被 `AsyncWaitLoop` 读取，类中没有任何地方写入它。
-   - 测试：`test_ucm_kv_prefetch.cpp / UCMLoadSSDDoesNotEnqueueAsyncWait_BugDocumented`、
+    （已过时 —— 随机制删除而解决）
+    load-to-host-buffer 迁移整体删除了旧的后台等待线程模型
+    （`UCMWait` / `AsyncWaitLoop` / `mTaskHandle` / `mWaitQueue_` 及
+    `ucm_wait` pybind 绑定）：`UCMKVPrefetch` 现在是轻量同步封装，
+    `UCMLoadSSD` 为每个 (blockId, layerID) 提交一个 `Load` shard 并返回
+    `PrefetchStatus` 状态码，因此"任务永不入队导致挂死"的问题不复存在。
+   - 原先固化该 bug 的测试（`UCMLoadSSDDoesNotEnqueueAsyncWait_BugDocumented`、
      `AsyncWaiterNeverProcessesDueToMissingEnqueue_BugDocumented`、
-     `WaitSSDToHostFailurePathUnreachableDueToEnqueueBug_BugDocumented`。
-   - 修复建议：在 `UCMLoadSSD` 末尾（持 `mTaskMu_`）将 `mTaskID` 推入
-     `mWaitQueue_`，并 `mTaskCv_.notify_one()`。
+     `WaitSSDToHostFailurePathUnreachableDueToEnqueueBug_BugDocumented`）
+     已随机制一并删除；`test_ucm_kv_prefetch.cpp` 现覆盖状态码接口。
 
 12. **`kvcache_task_manger.h` —— `TaskInfo` 默认构造函数未初始化 POD 成员。**
     `TaskInfo() {};` 函数体为空，因此 `taskID`、`layerID`（普通 `int`）是默认初始化

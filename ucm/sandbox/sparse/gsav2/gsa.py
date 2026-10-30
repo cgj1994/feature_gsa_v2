@@ -906,7 +906,7 @@ class GSA(UcmSparseBase):
         self.prefetch_engine.prefetch_engine_c.set_store_v1(store_ptr)
         actual_store_ptr = self.prefetch_engine.prefetch_engine_c.get_store_v1_ptr()
         cpp_self_ptr = self.prefetch_engine.prefetch_engine_c.get_self_ptr()
-        self.ucm_prefetch_engine.store_init(store_ptr)
+        self.ucm_prefetch_engine.store_init(store_ptr, self.layer_num)
         logger.info(
             "[GSA Store Inject] C++ verify cpp_self=%s, expected_store=%s, actual_store=%s",
             hex(cpp_self_ptr),

@@ -572,7 +572,7 @@ class TestStoreInjection:
         g.prefetch_engine.prefetch_engine_c.store_v1_ptr = 4096
         assert g._inject_store_v1(fakes.make_plain_connector(store_ptr=4096))
         assert g._store_injected is True
-        assert g.ucm_prefetch_engine.calls == [("store_init", 4096)]
+        assert g.ucm_prefetch_engine.calls == [("store_init", 4096, 2)]  # ptr + layer_num(=2)
 
     def test_inject_store_v1_verification_failure(self, gsa_worker):
         g = gsa_worker

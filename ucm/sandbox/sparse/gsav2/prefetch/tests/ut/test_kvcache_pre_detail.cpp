@@ -12,6 +12,11 @@
 
 namespace ucmprefetch {
 
+/* average2d is still defined in src/kvcache_pre.cpp but its declaration was
+ * dropped from kvcache_pre.h by the load-to-host-buffer migration; re-declare
+ * it here so the UT can keep exercising the zero-division guard. */
+float average2d(const std::vector<std::vector<float>>& matrix);
+
 /* ---- KVPackFail / KVPackAbort ---- */
 
 TEST(KVPackDetail, KVPackFailSetsFatalFlagAndReturnsMinusOne)

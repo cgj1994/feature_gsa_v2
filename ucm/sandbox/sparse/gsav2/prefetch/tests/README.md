@@ -34,7 +34,7 @@ tests/
 │   ├── test_hbm_manager.cpp        # HBMManager: LRU, pinned slots, miss/eviction, invariants
 │   ├── test_logger.cpp             # Logger: levels, filtering, file lifecycle
 │   ├── test_kvcache_pre_detail.cpp # KVPackFail/Abort, structs, average/average2d
-│   ├── test_ucm_kv_prefetch.cpp    # UCMKVPrefetch async load/wait/lookup lifecycle
+│   ├── test_ucm_kv_prefetch.cpp    # UCMKVPrefetch store-init/load/lookup status-code surface
 │   ├── test_kvcache_trans_ascend.cpp # ACL wrappers via stub (success + failure branches)
 │   ├── test_kvcache_task_manger.cpp   # TaskManager thread pool + TaskInfo/ThreadInfo/TaskWrapper
 │   └── test_gsa_prefetch_engine.cpp   # GSAPrefetchEngineC testable public surface
@@ -105,7 +105,7 @@ Features:
 | Production dependency | Test double | How failures are injected |
 |-----------------------|-------------|----------------------------|
 | `<acl/acl.h>`, `<aclnnop/…>` | `kvcache_trans_ascend_stub.h` | `acl_stub::Stub().memcpyAsyncFails`, `…mallocFails`, `…createStreamFails`, … |
-| `UC::StoreV1` (`mStoreV1_`) | `common/mock_store_v1.h` (`MockStoreV1`) | `loadToHostBufferFails`, `loadToDeviceFails`, `mismatchedViewCount`, `nullHostAddr`, … |
+| `UC::StoreV1` (`mStoreV1_`) | `common/mock_store_v1.h` (`MockStoreV1`) | `loadFails`, `waitFails`, `lookupFails`, `loadToHostBufferFails` (legacy), `mismatchedViewCount` (legacy), … |
 | `securec.h` | `common/securec.h` (empty) | n/a (no securec symbol is referenced) |
 | ACL scatter / H2D | stub `aclrtMemcpyAsync` performs a real `memcpy`, `aclnnInplaceScatter` is a no-op | `inplaceScatterFails`, `memcpyAsyncFails` |
 | torch_npu | not required (only `at::Tensor` / `torch::Tensor` are used) | n/a |
@@ -162,11 +162,13 @@ a comment describing the expected fix.
    - Suggested fix: propagate the error (return an enum or log at ERROR).
 
 6. **`kvcache_pre.cpp` — `average2d` divides by zero on non-empty matrix of
-   empty rows.**
+   empty rows.** *(FIXED)*
    When `matrix` is non-empty but every row is empty, `count == 0` and the
    final `sum / count` produces NaN.
-   - Test: `test_kvcache_pre_detail.cpp / Average2dBug.NonEmptyMatrixOfEmptyRowsProducesNaNByZeroDivision`.
-   - Suggested fix: guard `if (count == 0) { return 0.0f; }`.
+   - Test: `test_kvcache_pre_detail.cpp / Average2dBug.NonEmptyMatrixOfEmptyRowsReturnsZeroAfterFix`.
+   - Fix applied (the target-side guard `if (count == 0) { return 0.0f; }` was
+     kept when merging the load-to-host-buffer migration, whose patch carried
+     an equivalent `return 0;`).
 
 7. **`kvcache_pre.cpp` — `SetTokensMap` can dereference a null `HBMManager*`
    on the first layer-0 call with `isNeedInit=false`.**
@@ -210,18 +212,19 @@ a comment describing the expected fix.
       `mLayerNum` before indexing.
 
 11. **`kvcache_prefetch.h` — `UCMLoadSSD` never enqueues into `mWaitQueue_`.**
-    `UCMLoadSSD` registers the load handle in `mTaskHandle` but never pushes the
-    taskID onto `mWaitQueue_` nor notifies `mTaskCv_`. As a result the background
-    `AsyncWaitLoop` never wakes to process the task, `WaitSSDToHost` /
-    `ReleaseHostBuffer` are never called, and a subsequent `UCMWait(taskID)`
-    blocks forever (its predicate `mTaskHandle.find(taskID) == end()` never
-    becomes true). The `mWaitQueue_` member is read by `AsyncWaitLoop` but is
-    never written anywhere in the class.
-    - Tests: `test_ucm_kv_prefetch.cpp / UCMLoadSSDDoesNotEnqueueAsyncWait_BugDocumented`,
+    *(OBSOLETE — resolved by design removal)*
+    The old background waiter-thread model (`UCMWait` / `AsyncWaitLoop` /
+    `mTaskHandle` / `mWaitQueue_` / the `ucm_wait` pybind binding) was removed
+    wholesale by the load-to-host-buffer migration: `UCMKVPrefetch` is now a
+    thin synchronous wrapper whose `UCMLoadSSD` submits one `Load` shard per
+    (blockId, layerID) pair and returns a `PrefetchStatus` code, so the
+    never-enqueued-queue hang can no longer occur.
+    - The tests that used to pin the bug
+      (`UCMLoadSSDDoesNotEnqueueAsyncWait_BugDocumented`,
       `AsyncWaiterNeverProcessesDueToMissingEnqueue_BugDocumented`,
-      `WaitSSDToHostFailurePathUnreachableDueToEnqueueBug_BugDocumented`.
-    - Suggested fix: at the end of `UCMLoadSSD`, push `mTaskID` onto
-      `mWaitQueue_` and call `mTaskCv_.notify_one()` (under `mTaskMu_`).
+      `WaitSSDToHostFailurePathUnreachableDueToEnqueueBug_BugDocumented`)
+      were removed together with the mechanism; `test_ucm_kv_prefetch.cpp`
+      now covers the status-code surface.
 
 12. **`kvcache_task_manger.h` — `TaskInfo` default constructor leaves POD
     members uninitialized.** `TaskInfo() {};` has an empty body, so `taskID`

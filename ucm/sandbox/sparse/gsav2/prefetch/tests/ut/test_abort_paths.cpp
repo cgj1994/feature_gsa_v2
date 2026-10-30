@@ -218,7 +218,8 @@ TEST(AbortPaths, BuildUCMMergeBlockContextsAbortsOnNegativeMissGlobalId)
     UC::Detail::TaskDesc task;
     std::map<int, std::vector<size_t>> blockIdxToTokenIdx;
     EXPECT_DEATH(
-        engine->BuildUCMMergeBlockContexts(0, reqID, 0, blockContexts, task, blockIdxToTokenIdx),
+        engine->BuildUCMMergeBlockContexts(0, reqID, 0, blockContexts, task, blockIdxToTokenIdx,
+                                            nullptr, 0),
         "");
 }
 
